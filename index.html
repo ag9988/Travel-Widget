@@ -776,7 +776,9 @@
   <!-- Screen 1: Home -->
   <div id="home-screen" class="screen">
     <div class="header">
-      <div class="header-left"></div>
+      <div class="header-left">
+        <button class="text-btn" onclick="openSheet('api-key')" aria-label="API key settings">&#9881; API Key</button>
+      </div>
       <span class="header-title">My Trips</span>
       <div class="header-right" style="gap:8px">
         <button class="icon-btn" onclick="openNewTrip()" title="New trip" aria-label="New trip">+</button>
@@ -838,6 +840,11 @@
     <div class="sheet-inner" id="scan-review-content"></div>
   </div>
 
+  <!-- Sheet: API key -->
+  <div id="sheet-api-key" class="sheet-overlay" onclick="if(event.target===this)closeSheet()">
+    <div class="sheet-inner" id="api-key-content"></div>
+  </div>
+
   <!-- Hidden file picker for document scanning -->
   <input id="doc-input" type="file" multiple
     accept=".ics,.html,.eml,.txt,.pdf,text/calendar,text/plain,text/html,application/pdf"
@@ -847,6 +854,11 @@
 
 </body>
 <script>
+  // ─── Config ───────────────────────────────────────────────────────────────
+  const CLAUDE_MODEL = 'claude-haiku-4-5-20251001';
+  function getApiKey()     { return localStorage.getItem('tripgen-claude-key') || ''; }
+  function setApiKey(key)  { localStorage.setItem('tripgen-claude-key', key.trim()); }
+
   // ─── Constants ────────────────────────────────────────────────────────────
   const TYPES = {
     flight:      { label: 'Flight',      abbr: 'FLT',  color: '#0a84ff' },
@@ -868,7 +880,6 @@
   let detailItemId   = null;
   let scanResults    = [];
   let _scanState     = { scanning: false, processed: 0, total: 0 };
-  let _pdfjsLib      = null;
   let _pendingPdf    = null;   // { data: base64, name: string } | null
 
   // ─── Persistence ─────────────────────────────────────────────────────────
@@ -1142,6 +1153,7 @@
       case 'add-item':    _renderItemSheet();     break;
       case 'detail':      _renderDetailSheet();   break;
       case 'scan-review': _renderScanReview();    break;
+      case 'api-key':     _renderApiKeySheet();   break;
     }
   }
 
@@ -1660,38 +1672,112 @@
     } catch(e) { toast('Could not open PDF'); }
   }
 
+  // ─── API key sheet ────────────────────────────────────────────────────────
+  function _renderApiKeySheet() {
+    const key = getApiKey();
+    const masked = key ? key.slice(0, 12) + '••••••••••••••••••••' : '';
+    document.getElementById('api-key-content').innerHTML = `
+      <div class="sheet-handle"></div>
+      <div class="sheet-header">
+        <span class="sheet-title">Claude API Key</span>
+        <button class="x-btn" onclick="closeSheet()">&#10005;</button>
+      </div>
+      <div class="form-body">
+        <p style="font-size:13px;color:var(--text2);line-height:1.55;margin:10px 0 16px">
+          The Scan feature uses the Anthropic Claude API to extract travel details from your documents.
+          Get your key at <span style="color:var(--blue)">console.anthropic.com</span>.
+          It's stored only in this browser's localStorage — never sent anywhere except Anthropic.
+        </p>
+        <div class="field-label">API Key</div>
+        <input id="f-api-key" class="field-input" type="password"
+          placeholder="sk-ant-api03-…"
+          value="${esc(key)}"
+          autocomplete="off" spellcheck="false">
+        ${key ? `<p style="font-size:12px;color:var(--text3);margin-top:6px">Current key: ${esc(masked)}</p>` : ''}
+      </div>
+      <button class="btn-primary" onclick="saveApiKey()">Save Key</button>
+      ${key ? `<button class="btn-danger" onclick="clearApiKey()">Remove Key</button>` : ''}
+    `;
+    setTimeout(() => document.getElementById('f-api-key')?.focus(), 100);
+  }
+
+  function saveApiKey() {
+    const val = document.getElementById('f-api-key')?.value.trim();
+    if (!val) { toast('Paste your API key first'); return; }
+    if (!val.startsWith('sk-ant-')) { toast('That doesn\'t look like an Anthropic key'); return; }
+    setApiKey(val);
+    closeSheet();
+    toast('API key saved');
+  }
+
+  function clearApiKey() {
+    if (!confirm('Remove the saved API key?')) return;
+    localStorage.removeItem('tripgen-claude-key');
+    closeSheet();
+    toast('API key removed');
+  }
+
   // ─── Document scanner ──────────────────────────────────────────────────────
   function triggerScan() {
     if (!currentTripId) { toast('Open a trip first'); return; }
+    if (!getApiKey()) { openSheet('api-key'); return; }
     const el = document.getElementById('doc-input');
     el.value = '';
     el.click();
   }
 
-  async function _loadPdfJs() {
-    if (_pdfjsLib) return _pdfjsLib;
-    const PDFJS_CDN = 'https://cdn.jsdelivr.net/npm/pdfjs-dist@4.4.168/build/';
-    const lib = await import(PDFJS_CDN + 'pdf.min.mjs');
-    lib.GlobalWorkerOptions.workerSrc = PDFJS_CDN + 'pdf.worker.min.mjs';
-    _pdfjsLib = lib;
-    return lib;
-  }
+  const _CLAUDE_PROMPT = `Extract all travel items from this document. Return ONLY a JSON array — no markdown, no explanation.
 
-  async function _extractPdfText(file) {
-    const lib = await _loadPdfJs();
-    const buf = await file.arrayBuffer();
-    const pdf = await lib.getDocument({ data: buf }).promise;
-    let text = '';
-    for (let i = 1; i <= Math.min(pdf.numPages, 20); i++) {
-      const page = await pdf.getPage(i);
-      const content = await page.getTextContent();
-      text += content.items.map(it => it.str).join(' ') + '\n';
+Each object must have "type" (one of: flight, hotel, restaurant, sight, appointment, insurance, visa) plus these fields by type:
+
+flight:      { airline, flightNum, from (IATA 3-letter), to (IATA 3-letter), date (YYYY-MM-DD departure), time (HH:MM 24h departure), arrivalDate, arrivalTime, confirmNum, notes }
+hotel:       { name, address, date (YYYY-MM-DD check-in), time, checkOut (YYYY-MM-DD), checkOutTime, confirmNum, notes }
+restaurant:  { name, address, date, time, reservationNum, notes }
+sight:       { name, address, date, time, ticketInfo, notes }
+appointment: { name, location, date, time, notes }
+insurance:   { provider, coverage, policyNum, date (valid from), endDate (valid until), phone, notes }
+visa:        { docType, country, docNum, date (issue date), expiry (YYYY-MM-DD), notes }
+
+Rules:
+- Use null for any missing field (not empty string).
+- Dates must be YYYY-MM-DD or null. Times must be HH:MM (24h) or null.
+- Return [] if no travel items are found.`;
+
+  async function _parseWithClaude(content) {
+    const resp = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-api-key': getApiKey(),
+        'anthropic-version': '2023-06-01',
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({
+        model: CLAUDE_MODEL,
+        max_tokens: 2048,
+        messages: [{ role: 'user', content: [
+          { type: 'text', text: _CLAUDE_PROMPT },
+          content,
+        ]}],
+      }),
+    });
+    if (!resp.ok) {
+      const err = await resp.json().catch(() => ({}));
+      throw new Error(err?.error?.message || `Claude API ${resp.status}`);
     }
-    return text.trim();
+    const json = await resp.json();
+    let raw = json.content?.[0]?.text || '[]';
+    // strip markdown code fences if present
+    raw = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```$/, '').trim();
+    try { return JSON.parse(raw); } catch { return []; }
   }
 
   async function handleFiles(fileList) {
     if (!fileList.length) return;
+    if (!getApiKey()) {
+      openSheet('api-key');
+      return;
+    }
     scanResults = [];
     _scanState  = { scanning: true, processed: 0, total: fileList.length };
     openSheet('scan-review');
@@ -1700,16 +1786,30 @@
       const ext = file.name.split('.').pop().toLowerCase();
       let items = [];
       try {
-        if (ext === 'ics') {
-          items = parseIcs(await file.text());
-        } else if (ext === 'pdf') {
-          const text = await _extractPdfText(file);
-          items = parseTextDocument(text, 'text/plain');
+        let content;
+        if (ext === 'pdf') {
+          const buf   = await file.arrayBuffer();
+          const bytes = new Uint8Array(buf);
+          let bin = '';
+          for (let i = 0; i < bytes.length; i++) bin += String.fromCharCode(bytes[i]);
+          content = { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: btoa(bin) } };
         } else {
-          const mediaType = (ext === 'html' || ext === 'eml') ? 'text/html' : 'text/plain';
-          items = parseTextDocument(await file.text(), mediaType);
+          let text = await file.text();
+          if (ext === 'html' || ext === 'eml') {
+            text = text
+              .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+              .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+              .replace(/<[^>]+>/g, ' ')
+              .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&')
+              .replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
+          }
+          content = { type: 'text', text };
         }
-      } catch(e) { /* skip silently */ }
+        items = await _parseWithClaude(content);
+        if (!Array.isArray(items)) items = [];
+      } catch(e) {
+        toast(`Scan failed: ${e.message}`);
+      }
 
       scanResults.push(...items.map(i => ({ ...i, _checked: true, _file: file.name })));
       _scanState.processed++;
@@ -1718,248 +1818,6 @@
 
     _scanState.scanning = false;
     _renderScanReview();
-  }
-
-  function parseIcs(text) {
-    const items = [];
-    const blocks = text.split(/BEGIN:VEVENT/i);
-
-    for (let i = 1; i < blocks.length; i++) {
-      const block = blocks[i];
-
-      const get = (key) => {
-        const m = block.match(new RegExp(key + '[^:\\r\\n]*:([^\\r\\n]+(?:\\r?\\n[ \\t][^\\r\\n]+)*)', 'i'));
-        return m ? m[1].replace(/\r?\n[ \t]/g, '').trim() : '';
-      };
-
-      const summary  = get('SUMMARY');
-      const location = get('LOCATION');
-      const desc     = get('DESCRIPTION').replace(/\\n/g, ' ');
-      const dtstart  = get('DTSTART');
-      const dtend    = get('DTEND');
-
-      if (!summary) continue;
-
-      const parseDt = (dt) => {
-        if (!dt) return { date: '', time: '' };
-        const val = dt.replace(/^VALUE=DATE:/i, '').replace('Z', '').replace(/[T ]/,'T');
-        const d   = val.replace(/[^0-9T]/g, '');
-        return {
-          date: d.length >= 8 ? `${d.slice(0,4)}-${d.slice(4,6)}-${d.slice(6,8)}` : '',
-          time: d.length >= 13 ? `${d.slice(9,11)}:${d.slice(11,13)}` : '',
-        };
-      };
-
-      const start = parseDt(dtstart);
-      const end   = parseDt(dtend);
-      const haystack = (summary + ' ' + desc + ' ' + location).toLowerCase();
-
-      let type = 'appointment';
-      if (/\b(flight|airline|departs?|arrives?|gate|boarding)\b/.test(haystack)
-          || /\b[a-z]{2}\d{2,4}\b/.test(haystack)) {
-        type = 'flight';
-      } else if (/\b(hotel|check.?in|check.?out|resort|inn\b|suites?|lodg|hostel|motel)\b/.test(haystack)) {
-        type = 'hotel';
-      } else if (/\b(restaurant|reserv|dining|table for|opentable|resy|cafe|bistro)\b/.test(haystack)) {
-        type = 'restaurant';
-      } else if (/\b(museum|tour\b|ticket|admission|exhibit|attraction|gallery|concert|theater|theatre)\b/.test(haystack)) {
-        type = 'sight';
-      }
-
-      const item = { type, date: start.date, time: start.time, notes: '' };
-
-      if (type === 'flight') {
-        const fn = summary.match(/\b([A-Z]{2}\d{2,4})\b/);
-        const ap = (summary + ' ' + desc).match(/\b([A-Z]{3})\b/g) || [];
-        Object.assign(item, {
-          flightNum: fn ? fn[1] : '',
-          airline: '',
-          from: ap[0] || '',
-          to: ap[1] || '',
-          arrivalDate: end.date,
-          arrivalTime: end.time,
-          confirmNum: '',
-          notes: desc.slice(0, 200),
-        });
-      } else if (type === 'hotel') {
-        Object.assign(item, { name: summary, address: location, checkOut: end.date, checkOutTime: end.time, confirmNum: '' });
-      } else if (type === 'restaurant') {
-        Object.assign(item, { name: summary, address: location, reservationNum: '' });
-      } else if (type === 'sight') {
-        Object.assign(item, { name: summary, address: location, ticketInfo: '' });
-      } else {
-        Object.assign(item, { name: summary, location });
-      }
-
-      items.push(item);
-    }
-    return items;
-  }
-
-  function parseTextDocument(rawText, mediaType) {
-    let text = rawText;
-    if (mediaType === 'text/html') {
-      text = rawText
-        .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
-        .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-        .replace(/<[^>]+>/g, ' ')
-        .replace(/&nbsp;/gi, ' ').replace(/&amp;/gi, '&')
-        .replace(/&lt;/gi, '<').replace(/&gt;/gi, '>')
-        .replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim();
-    }
-
-    const lower = text.toLowerCase();
-
-    // ── Classify (score-based) ───────────────────────────────────────────────
-    const sc = { flight: 0, hotel: 0, restaurant: 0, sight: 0, insurance: 0, visa: 0 };
-    // Flight — require explicit aviation vocabulary; plain "XX1234" alone scores low
-    if (/\b(boarding pass|e-?ticket|gate\b|terminal\b)\b/.test(lower))         sc.flight += 4;
-    if (/\b(flight|airline|airways?|aircraft)\b/.test(lower))                   sc.flight += 3;
-    if (/\b(departs?|arrives?|layover|stopover)\b/.test(lower))                 sc.flight += 2;
-    if (/\b[a-z]{2}\d{3,4}\b/.test(text))                                       sc.flight += 1;
-    // Hotel
-    if (/\b(hotel|resort|inn\b|suites?\b|motel|hostel|lodg|accommodation)\b/.test(lower)) sc.hotel += 4;
-    if (/\b(check.?in|check.?out)\b/.test(lower))                               sc.hotel += 4;
-    if (/\b(room\b|nights?\b|property|front desk|concierge)\b/.test(lower))     sc.hotel += 2;
-    // Restaurant
-    if (/\b(restaurant|opentable|resy|yelp|dining)\b/.test(lower))              sc.restaurant += 4;
-    if (/\b(table for|reservation at|dining at)\b/.test(lower))                 sc.restaurant += 4;
-    if (/\b(cafe|bistro|grill|brasserie|eatery)\b/.test(lower))                 sc.restaurant += 3;
-    // Sight
-    if (/\b(museum|exhibit|gallery|attraction|concert|theater|theatre)\b/.test(lower)) sc.sight += 4;
-    if (/\b(ticket|admission|tour\b|show\b)\b/.test(lower))                     sc.sight += 2;
-    // Insurance
-    if (/\b(insurance|insured|insurer|underwriter|policy\b|policyholder)\b/.test(lower)) sc.insurance += 4;
-    if (/\b(coverage|premium|deductible|claim\b|beneficiary)\b/.test(lower))    sc.insurance += 3;
-    if (/\b(travel insurance|medical insurance|trip protection)\b/.test(lower)) sc.insurance += 4;
-    // Visa / Passport
-    if (/\b(passport|visa\b|entry permit|travel document)\b/.test(lower))       sc.visa += 4;
-    if (/\b(expiry|expires?|valid until|date of issue|nationality)\b/.test(lower)) sc.visa += 3;
-    if (/\b(embassy|consulate|immigration|customs)\b/.test(lower))              sc.visa += 2;
-
-    let type = 'appointment';
-    let best = 0;
-    for (const [t, s] of Object.entries(sc)) { if (s > best) { best = s; type = t; } }
-
-    // ── Date helpers ─────────────────────────────────────────────────────────
-    const MONTHS = { jan:1,feb:2,mar:3,apr:4,may:5,jun:6,jul:7,aug:8,sep:9,oct:10,nov:11,dec:12 };
-    function toIso(y, m, d) {
-      const yy = parseInt(y), mm = parseInt(m), dd = parseInt(d);
-      if (!yy || !mm || !dd) return null;
-      return `${yy}-${String(mm).padStart(2,'0')}-${String(dd).padStart(2,'0')}`;
-    }
-    function extractDates(s) {
-      const found = []; let m;
-      const r1 = /\b(202\d)-(0[1-9]|1[0-2])-([0-2]\d|3[01])\b/g;
-      while ((m = r1.exec(s)) !== null) found.push(toIso(m[1], m[2], m[3]));
-      const r2 = /\b(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s+(\d{1,2}),?\s*(202\d)\b/gi;
-      while ((m = r2.exec(s)) !== null) found.push(toIso(m[3], MONTHS[m[1].slice(0,3).toLowerCase()], m[2]));
-      const r3 = /\b(\d{1,2})\s+(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?\s*(202\d)\b/gi;
-      while ((m = r3.exec(s)) !== null) found.push(toIso(m[3], MONTHS[m[2].slice(0,3).toLowerCase()], m[1]));
-      const r4 = /\b(0?[1-9]|1[0-2])\/(0?[1-9]|[12]\d|3[01])\/(202\d)\b/g;
-      while ((m = r4.exec(s)) !== null) found.push(toIso(m[3], m[1], m[2]));
-      return [...new Set(found)].filter(Boolean).sort();
-    }
-    function extractTime(s) {
-      const m12 = s.match(/\b(\d{1,2}):(\d{2})\s*(am|pm)\b/i);
-      if (m12) {
-        let h = parseInt(m12[1]);
-        if (m12[3].toLowerCase() === 'pm' && h !== 12) h += 12;
-        if (m12[3].toLowerCase() === 'am' && h === 12) h = 0;
-        return `${String(h).padStart(2,'0')}:${m12[2]}`;
-      }
-      const m24 = s.match(/\b([01]\d|2[0-3]):([0-5]\d)\b/);
-      return m24 ? `${m24[1]}:${m24[2]}` : null;
-    }
-    function extractConfirm(s) {
-      const m = s.match(/\b(?:confirmation|booking|reservation|record\s+locator|ref(?:erence)?|order)\s*(?:#|number|num|no\.?|code|id)?\s*:?\s*([A-Z0-9]{4,12})\b/i);
-      return m ? m[1].toUpperCase() : '';
-    }
-
-    const dates = extractDates(text);
-    const date  = dates[0] || null;
-    const time  = extractTime(text);
-    const confirmNum = extractConfirm(text);
-    const item  = { type, date, time: time || null, notes: '' };
-
-    if (type === 'flight') {
-      const fn = text.match(/\b([A-Z]{2})\s*(\d{3,4})\b/);
-      const AIRLINES = ['American Airlines','Delta','United','Southwest','JetBlue',
-        'Alaska Airlines','Spirit','Frontier','Air France','British Airways',
-        'Lufthansa','Emirates','KLM','Iberia','Air Canada','Qatar Airways',
-        'Singapore Airlines','Turkish Airlines','Cathay Pacific','Ryanair','EasyJet'];
-      const airline = AIRLINES.find(a => lower.includes(a.toLowerCase())) || '';
-      const SKIP = new Set(['THE','AND','FOR','YOU','HAS','NOT','ARE','BUT','WITH',
-        'FROM','THIS','THAT','THEY','HAVE','WILL','YOUR','BEEN','CAN','ALL','ONE',
-        'OUT','INC','LLC','LTD','CEO','ETD','ETA','PDF','URL','FAX','VIA','REF','PER','DUE']);
-      const codes = [...text.matchAll(/\b([A-Z]{3})\b/g)].map(m => m[1]).filter(c => !SKIP.has(c));
-      Object.assign(item, {
-        airline,
-        flightNum: fn ? fn[1] + fn[2] : '',
-        from: codes[0] || '',
-        to: codes[1] || '',
-        arrivalDate: dates[1] || dates[0] || null,
-        arrivalTime: null,
-        confirmNum,
-      });
-    } else if (type === 'hotel') {
-      const nm = text.match(/([A-Z][a-zA-Z\s&'-]{2,40}(?:Hotel|Inn|Resort|Suites?|Lodge|Hostel|Motel|Manor|House))/i)
-        || text.match(/(?:property|hotel|staying at)\s*:?\s*([A-Z][^\n,]{3,50})/i);
-      Object.assign(item, {
-        name: nm ? nm[1].trim() : '',
-        address: '',
-        checkOut: dates[1] || null,
-        checkOutTime: null,
-        confirmNum,
-      });
-    } else if (type === 'restaurant') {
-      const nm = text.match(/(?:at|dining at|reservation at|table at)\s+([A-Z][^\n,]{2,50})/i)
-        || text.match(/([A-Z][a-zA-Z\s&'-]{2,40}(?:Restaurant|Cafe|Bistro|Grill|Kitchen|Eatery|Bar|Tavern))/i);
-      Object.assign(item, {
-        name: nm ? nm[1].trim() : '',
-        address: '',
-        reservationNum: confirmNum,
-      });
-    } else if (type === 'sight') {
-      const nm = text.match(/(?:at|visit|admission to|tickets? (?:for|to)|tour of)\s+([A-Z][^\n,]{2,60})/i)
-        || text.match(/^([A-Z][^\n,.]{4,60})/m);
-      Object.assign(item, {
-        name: nm ? nm[1].trim() : '',
-        address: '',
-        ticketInfo: confirmNum,
-      });
-    } else if (type === 'insurance') {
-      const provM = text.match(/(?:insurer|provider|company|issued by)\s*:?\s*([A-Z][^\n,]{2,50})/i)
-        || text.match(/([A-Z][a-zA-Z\s&'-]{2,40}(?:Insurance|Assurance|Protect|Cover))/i);
-      const polM  = text.match(/\b(?:policy|policy no\.?|policy #)\s*:?\s*([A-Z0-9-]{4,20})\b/i);
-      const phM   = text.match(/\b(?:emergency|contact|phone|tel)\s*(?:number|phone|#)?\s*:?\s*([\+\d][\d\s\-().]{6,20})/i);
-      Object.assign(item, {
-        provider:  provM ? provM[1].trim() : '',
-        coverage:  '',
-        policyNum: polM  ? polM[1].toUpperCase() : confirmNum,
-        endDate:   dates[1] || null,
-        phone:     phM   ? phM[1].trim() : '',
-      });
-    } else if (type === 'visa') {
-      const countryM = text.match(/\b(?:country|nation|issued by|for)\s*:?\s*([A-Z][a-zA-Z\s]{2,30})\b/i);
-      const docM     = text.match(/\b(?:passport|visa|document)\s*(?:no\.?|number|#)\s*:?\s*([A-Z0-9]{5,15})\b/i);
-      const expiryM  = text.match(/\b(?:expiry|expiration|expires?|valid until)\s*:?\s*([\d\/\-]+|[A-Za-z]+\s+\d+[,\s]+\d+)\b/i);
-      Object.assign(item, {
-        docType:  '',
-        country:  countryM ? countryM[1].trim() : '',
-        docNum:   docM ? docM[1].toUpperCase() : '',
-        expiry:   dates[1] || null,
-      });
-    } else {
-      const nm = text.match(/(?:appointment|meeting|event|session)\s+(?:with|at|for)?\s+([A-Z][^\n,]{2,60})/i)
-        || text.match(/^([A-Z][^\n,.]{4,60})/m);
-      Object.assign(item, {
-        name: nm ? nm[1].trim() : '',
-        location: '',
-      });
-    }
-
-    return [item];
   }
 
   function _renderScanReview() {
